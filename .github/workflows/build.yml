@@ -1,0 +1,135 @@
+name: Збірка APK
+
+# На кожен push у main — зібрати Android APK через Buildozer, покласти
+# готовий файл в Artifacts запуску і у GitHub Release з тегом v<версія> —
+# звідти APK качається прямим посиланням без входу в GitHub.
+# workflow_dispatch — щоб перезапустити збірку вручну без нового коміту.
+# Кроки й версії — як у Вужа (lebichnazar19-create/mova, build.yml).
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+jobs:
+  build-apk:
+    name: Buildozer -> APK
+    # Не ubuntu-latest: рецепт libffi падає на autoreconf з новими
+    # autoconf/libtool у ubuntu-24.04. 22.04 — перевірена версія для p4a.
+    runs-on: ubuntu-22.04
+    # Крок «Реліз» створює тег і GitHub Release — потрібен запис у репозиторій.
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Android Gradle Plugin вимагає саме Java 17.
+      - name: Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Системні пакети для python-for-android
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            git zip unzip autoconf libtool pkg-config \
+            zlib1g-dev libncurses-dev cmake libffi-dev libssl-dev \
+            build-essential ccache \
+            libtool-bin libltdl-dev automake m4
+
+      - name: Buildozer + Cython
+        run: pip install buildozer cython
+
+      # versionCode з versiya.py — щоб нова версія ставилась поверх старої
+      - name: Числова версія
+        run: |
+          python3 - <<'PY'
+          import pathlib, re
+          from versiya import ВЕРСІЯ, ЧИСЛОВА_ВЕРСІЯ
+          spec = pathlib.Path("buildozer.spec")
+          spec.write_text(re.sub(r"^android\.numeric_version = .*$", f"android.numeric_version = {ЧИСЛОВА_ВЕРСІЯ}", spec.read_text(encoding="utf-8"), flags=re.M), encoding="utf-8")
+          print("версія", ВЕРСІЯ, "код", ЧИСЛОВА_ВЕРСІЯ)
+          PY
+          echo "VERSIYA=$(python3 -c 'from versiya import ВЕРСІЯ; print(ВЕРСІЯ)')" >> "$GITHUB_ENV"
+
+      # Android SDK/NDK і Gradle — сотні МБ, однакові від збірки до збірки.
+      - name: Кеш Buildozer і Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.buildozer
+            ~/.gradle
+          key: buildozer-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}
+          restore-keys: |
+            buildozer-${{ runner.os }}-
+
+      - name: Прийняти ліцензії Android SDK
+        run: |
+          set -e
+          SDK_DIR="$HOME/.buildozer/android/platform/android-sdk"
+          # Холодний кеш: перший прогін падає на ліцензіях, але докачує SDK
+          # і sdkmanager. Теплий кеш: нічого не робить.
+          if [ ! -d "$SDK_DIR" ]; then
+            buildozer -v android debug || true
+          fi
+          SDKMANAGER=$(find "$SDK_DIR" -type f -name sdkmanager 2>/dev/null | head -n1)
+          if [ -z "$SDKMANAGER" ]; then
+            echo "sdkmanager не знайдено в $SDK_DIR навіть після першого прогону buildozer" >&2
+            exit 1
+          fi
+          yes | "$SDKMANAGER" --sdk_root="$SDK_DIR" --licenses || true
+
+      - name: Що пакується
+        run: |
+          echo "коміт: $(git log -1 --oneline)"
+          echo "версія: $VERSIYA"
+          ls -la *.py
+          grep -n "^version\|numeric_version\|include_exts\|exclude_dirs\|^source.dir" buildozer.spec || true
+
+      - name: Зібрати APK (buildozer android debug)
+        run: buildozer -v android debug
+
+      - name: Завантажити APK в Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: дуб-APK-${{ env.VERSIYA }}
+          path: bin/*.apk
+          if-no-files-found: error
+
+      # Реліз — лише після успішної збірки на main. Поки версія та сама,
+      # кожна збірка оновлює той самий реліз (тег пересувається, APK
+      # замінюється). У релізі два однакові файли: dub-<версія>-…apk і
+      # dub.apk — стала назва, тож releases/latest/download/dub.apk
+      # завжди веде на найновіший APK.
+      - name: Реліз — тег v<версія> і APK у GitHub Releases
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          TAG="v${VERSIYA}"
+          APK=$(ls bin/*.apk | head -n1)
+          cp "$APK" dub.apk
+          cat > notes.md <<EOF
+          «Дуб» ${VERSIYA} для Android (arm64-v8a, debug) — візуальне полотно для коду.
+
+          Збірка з коміту ${GITHUB_SHA::7} ($(date -u '+%Y-%m-%d %H:%M UTC')).
+          Завантаж \`dub.apk\` (або \`$(basename "$APK")\` — той самий файл) і встанови на телефон.
+          EOF
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            git tag -f "$TAG" "$GITHUB_SHA"
+            git push -f origin "refs/tags/$TAG"
+            gh release upload "$TAG" "$APK" dub.apk --clobber
+            gh release edit "$TAG" --title "Дуб ${VERSIYA}" --notes-file notes.md --latest
+          else
+            gh release create "$TAG" "$APK" dub.apk --target "$GITHUB_SHA" \
+              --title "Дуб ${VERSIYA}" --notes-file notes.md --latest
+          fi
+          gh release view "$TAG" --json url,assets --jq '.url, (.assets[] | .name + " " + (.size|tostring))'

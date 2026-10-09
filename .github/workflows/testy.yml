@@ -1,0 +1,27 @@
+name: Тести
+
+# На кожен push і pull request — pytest на комп'ютері без Kivy
+# (тести/pidrobka_kivy.py підміняє Kivy). Python 3.11 — як у збірці APK.
+on:
+  push:
+  pull_request:
+  workflow_dispatch: {}
+
+jobs:
+  pytest:
+    name: pytest тести/
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: pytest
+        run: pip install pytest
+
+      - name: Тести
+        run: python3 -m pytest тести/ -q
